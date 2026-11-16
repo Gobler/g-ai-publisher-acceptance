@@ -1,0 +1,1 @@
+Synthetic baseline for one controlled task change.
