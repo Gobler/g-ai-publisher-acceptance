@@ -20,7 +20,7 @@ jobs:
           set -euo pipefail
           repo=Gobler/g-ai-publisher-acceptance
           repo_id=1460060089
-          check_name=g-ai-fixture-diff-s07-t03
+          check_name=g-ai-fixture-contents-s07-t03
           base=d8a1b64a51ae1676824e3c297b238f21cf0f7a59
           head=28e9520db58827b74aa6bddf99d96602851ab96b
           head_ref=codex/task-4144a7c0-b2da-4453-ab74-dd5bd89a9b55-g1
@@ -81,12 +81,13 @@ jobs:
               {name: $name, head_sha: $head, details_url: $details_url, external_id: $external_id,
                status: "completed", conclusion: "success", output: {
                  title: "Verified exact S07-T03 fixture diff",
-                 summary: "Verified PR #1 on base \($base), direct parent, one added 100644 text blob \($blob), and exact bytes. Workflow commit \($sha)."
+                 summary: "Verified PR #1 on base \($base), direct parent, one added 100644 text blob \($blob), and exact bytes. Workflow commit \($sha). [Workflow run](\($details_url))."
                }}
             ' | api --method POST "$endpoint/check-runs" --input -)
           jq -e --arg name "$check_name" --arg head "$head" --arg details_url "$details_url" \
-            --arg external_id "$external_id" '
-              select(.name == $name and .head_sha == $head and .details_url == $details_url
+            --arg external_id "$external_id" --arg check_url "$GITHUB_SERVER_URL/$repo/runs/" '
+              select(.name == $name and .head_sha == $head and (.id | type == "number")
+                and (.details_url == $details_url or .details_url == ($check_url + (.id | tostring)))
                 and .external_id == $external_id and .status == "completed" and .conclusion == "success"
                 and .app.id == 15368 and .app.slug == "github-actions")
               | {id, name, head_sha, details_url, external_id, app: .app.id}
