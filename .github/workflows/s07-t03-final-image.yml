@@ -23,7 +23,6 @@ jobs:
       EXPECTED_BASE_SHA: d8a1b64a51ae1676824e3c297b238f21cf0f7a59
       EXPECTED_HEAD_SHA: 28e9520db58827b74aa6bddf99d96602851ab96b
       EXPECTED_TREE_SHA: 1732794b6d2653e51bfe69792791578d40655bb5
-      DOCKER_CONFIG: ${{ runner.temp }}/s07-t03-docker
     steps:
       - name: Verify the GitHub squash and collect only the exact fixture blobs
         env:
@@ -176,7 +175,9 @@ jobs:
           except URLError:
               raise SystemExit('Registry tag lookup unavailable') from None
           PY
+          export DOCKER_CONFIG="$RUNNER_TEMP/s07-t03-docker"
           mkdir -m 0700 "$DOCKER_CONFIG"
+          printf 'DOCKER_CONFIG=%s\n' "$DOCKER_CONFIG" >> "$GITHUB_ENV"
           printf '%s' "$GH_TOKEN" | docker login ghcr.io --username "$GITHUB_ACTOR" --password-stdin
           unset GH_TOKEN
           source_url="https://github.com/$GITHUB_REPOSITORY"
