@@ -1,0 +1,259 @@
+name: Build and attest the S07-T03 squash fixture
+on:
+  push:
+    branches: [codex/t03-trusted-final-image]
+permissions: {}
+concurrency:
+  group: s07-t03-fixture-final-image
+  cancel-in-progress: false
+jobs:
+  candidate:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 8
+    permissions:
+      contents: read
+      pull-requests: read
+      checks: read
+      packages: write
+      attestations: write
+      id-token: write
+    env:
+      IMAGE: ghcr.io/gobler/g-ai-publisher-acceptance-s07-t03
+      EXPECTED_MERGE_SHA: 9d1c96cdd821dbff995a188bac23118279daf3ea
+      EXPECTED_BASE_SHA: d8a1b64a51ae1676824e3c297b238f21cf0f7a59
+      EXPECTED_HEAD_SHA: 28e9520db58827b74aa6bddf99d96602851ab96b
+      EXPECTED_TREE_SHA: 1732794b6d2653e51bfe69792791578d40655bb5
+      DOCKER_CONFIG: ${{ runner.temp }}/s07-t03-docker
+    steps:
+      - name: Verify the GitHub squash and collect only the exact fixture blobs
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          import base64
+          import hashlib
+          import json
+          import os
+          from pathlib import Path
+          import re
+          import subprocess
+
+          def require(condition, reason):
+              if not condition:
+                  raise SystemExit(reason)
+
+          repo = 'Gobler/g-ai-publisher-acceptance'
+          ref = 'refs/heads/codex/t03-trusted-final-image'
+          repo_id = 1460060089
+          target = os.environ['EXPECTED_MERGE_SHA']
+          base = os.environ['EXPECTED_BASE_SHA']
+          head = os.environ['EXPECTED_HEAD_SHA']
+          tree = os.environ['EXPECTED_TREE_SHA']
+          require(re.fullmatch(r'[0-9a-f]{40}', target) and target not in {head, base, '0' * 40},
+                  'Expected the confirmed and distinct squash SHA')
+          require(os.environ['GITHUB_SERVER_URL'] == 'https://github.com'
+                  and os.environ['GITHUB_REPOSITORY'] == repo
+                  and int(os.environ['GITHUB_REPOSITORY_ID']) == repo_id
+                  and os.environ['GITHUB_REF'] == ref and os.environ['GITHUB_EVENT_NAME'] == 'push'
+                  and os.environ['GITHUB_ACTOR'] == 'Gobler' and os.environ['GITHUB_TRIGGERING_ACTOR'] == 'Gobler'
+                  and os.environ['GITHUB_RUN_ATTEMPT'] == '1', 'Unexpected workflow identity or invocation')
+
+          def get(path):
+              return json.loads(subprocess.check_output([
+                  'gh', 'api', '-H', 'X-GitHub-Api-Version: 2022-11-28', f'repos/{repo}/{path}'
+              ]))
+
+          pr = get('pulls/1')
+          require(pr['number'] == 1 and pr['state'] == 'closed' and pr['merged'] is True
+                  and bool(pr['merged_at']) and pr['merge_commit_sha'] == target
+                  and pr['merged_by']['login'] == 'g-ai-merger-gobler-20261116[bot]'
+                  and pr['merged_by']['id'] == 357395813 and pr['merged_by']['type'] == 'Bot'
+                  and pr['base']['ref'] == 'main' and pr['base']['repo']['id'] == repo_id
+                  and pr['head']['sha'] == head and pr['head']['repo']['id'] == repo_id
+                  and pr['head']['ref'] == 'codex/task-4144a7c0-b2da-4453-ab74-dd5bd89a9b55-g1',
+                  'GitHub did not confirm the expected squash by the merger bot')
+          require(get('git/ref/heads/main')['object']['sha'] == target, 'main does not match the squash SHA')
+          check = get('check-runs/134976875224')
+          require(check['head_sha'] == head and check['app']['id'] == 15368 and check['app']['slug'] == 'github-actions'
+                  and check['name'] == 'g-ai-fixture-contents-s07-t03' and check['status'] == 'completed'
+                  and check['conclusion'] == 'success', 'Trusted pre-merge check does not match')
+          commit = get(f'git/commits/{target}')
+          require(commit['sha'] == target and [parent['sha'] for parent in commit['parents']] == [base]
+                  and commit['tree']['sha'] == tree, 'Unexpected squash parent or tree')
+          expected = {
+              'README.md': ('b6562433730ae8e91b741485b3a5ae9b699d758a', 184),
+              'example.txt': ('629d88faabc6daea459032fe178645e5f2d93c4e', 51),
+              'g-ai-acceptance-4144a7c0-b2da-4453-ab74-dd5bd89a9b55.txt': ('ae6cf5660b6b17866a3f1b39b27bedaa38571697', 47),
+          }
+          listing = get(f'git/trees/{tree}')
+          require(listing['sha'] == tree and listing['truncated'] is False and len(listing['tree']) == len(expected)
+                  and {entry['path'] for entry in listing['tree']} == set(expected)
+                  and all(entry['type'] == 'blob' and entry['mode'] == '100644'
+                          and (entry['sha'], entry['size']) == expected[entry['path']] for entry in listing['tree']),
+                  'Unexpected files, modes, or blobs in the final source tree')
+          root = Path(os.environ['RUNNER_TEMP']) / 's07-t03-context'
+          payload = root / 'fixture'
+          payload.mkdir(parents=True)
+          hashes = {}
+          for name, (sha, size) in expected.items():
+              blob = get(f'git/blobs/{sha}')
+              require(blob['sha'] == sha and blob['encoding'] == 'base64' and blob['size'] == size,
+                      'GitHub blob metadata mismatch')
+              data = base64.b64decode(''.join(blob['content'].splitlines()), validate=True)
+              require(len(data) == size and hashlib.sha1(f'blob {size}\0'.encode() + data).hexdigest() == sha,
+                      'Git blob bytes mismatch')
+              (payload / name).write_bytes(data)
+              (payload / name).chmod(0o644)
+              hashes[name] = hashlib.sha256(data).hexdigest()
+          (root / 'Dockerfile').write_text('FROM scratch\nCOPY fixture/ /fixture/\nUSER 65532:65532\n')
+          (root.parent / 's07-t03-files.json').write_text(json.dumps(hashes))
+          print(f'Confirmed fixture PR #1: {head} -> {target}, tree {tree}, {len(hashes)} files')
+          PY
+
+      - name: Build and push the verified final commit, then test the pulled digest
+        id: image
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import base64
+          import json
+          import os
+          import re
+          from urllib.error import HTTPError, URLError
+          from urllib.parse import urlencode
+          from urllib.request import HTTPRedirectHandler, Request, build_opener
+
+          class NoRedirect(HTTPRedirectHandler):
+              def redirect_request(self, *args, **kwargs):
+                  return None
+
+          opener = build_opener(NoRedirect())
+          registry = 'https://ghcr.io'
+          image = os.environ['IMAGE'].removeprefix('ghcr.io/')
+          tag = 'sha-' + os.environ['EXPECTED_MERGE_SHA']
+          if image != 'gobler/g-ai-publisher-acceptance-s07-t03' or not re.fullmatch(r'sha-[a-f0-9]{40}', tag):
+              raise SystemExit('Unexpected registry target')
+          user = os.environ['GITHUB_ACTOR']
+          basic = base64.b64encode(f'{user}:{os.environ["GH_TOKEN"]}'.encode()).decode()
+          query = urlencode({'service': 'ghcr.io', 'scope': f'repository:{image}:pull,push'})
+          try:
+              request = Request(f'{registry}/token?{query}', headers={'Authorization': f'Basic {basic}'})
+              with opener.open(request, timeout=15) as response:
+                  value = json.loads(response.read(65536))
+              bearer = value.get('token') or value.get('access_token')
+              if not isinstance(bearer, str) or not bearer or len(bearer) > 16384 or any(ch.isspace() for ch in bearer):
+                  raise SystemExit('Registry token response could not be verified')
+          except HTTPError as error:
+              raise SystemExit(f'Registry authorization failed with HTTP {error.code}') from None
+          except (URLError, ValueError):
+              raise SystemExit('Registry authorization response unavailable') from None
+          media = ', '.join(('application/vnd.oci.image.manifest.v1+json', 'application/vnd.oci.image.index.v1+json',
+                            'application/vnd.docker.distribution.manifest.v2+json', 'application/vnd.docker.distribution.manifest.list.v2+json'))
+          try:
+              request = Request(f'{registry}/v2/{image}/manifests/{tag}',
+                                headers={'Authorization': f'Bearer {bearer}', 'Accept': media})
+              with opener.open(request, timeout=15) as response:
+                  if response.status == 200:
+                      digest = response.headers.get('Docker-Content-Digest', '')
+                      suffix = f' {digest}' if re.fullmatch(r'sha256:[a-f0-9]{64}', digest) else ''
+                      raise SystemExit('Candidate tag already exists; reconcile its provenance before any retry.' + suffix)
+                  raise SystemExit(f'Unexpected registry response HTTP {response.status}')
+          except HTTPError as error:
+              if error.code != 404:
+                  raise SystemExit(f'Registry tag lookup failed with HTTP {error.code}') from None
+              try:
+                  errors = json.loads(error.read(65536))['errors']
+                  codes = {entry['code'] for entry in errors}
+              except (ValueError, KeyError, TypeError):
+                  raise SystemExit('Registry did not prove absence of the candidate tag') from None
+              if not codes or not codes.issubset({'MANIFEST_UNKNOWN', 'NAME_UNKNOWN'}):
+                  raise SystemExit('Registry did not prove absence of the candidate tag') from None
+              print('Registry confirmed that the exact candidate tag is absent.')
+          except URLError:
+              raise SystemExit('Registry tag lookup unavailable') from None
+          PY
+          mkdir -m 0700 "$DOCKER_CONFIG"
+          printf '%s' "$GH_TOKEN" | docker login ghcr.io --username "$GITHUB_ACTOR" --password-stdin
+          unset GH_TOKEN
+          source_url="https://github.com/$GITHUB_REPOSITORY"
+          metadata="$RUNNER_TEMP/s07-t03-build.json"
+          docker buildx build --platform linux/amd64 --network none --provenance=false --sbom=false \
+            --label "org.opencontainers.image.source=$source_url" \
+            --label "org.opencontainers.image.revision=$EXPECTED_MERGE_SHA" \
+            --label "io.github.gobler.source-tree=$EXPECTED_TREE_SHA" \
+            --tag "$IMAGE:sha-$EXPECTED_MERGE_SHA" --output type=registry,oci-mediatypes=true \
+            --metadata-file "$metadata" "$RUNNER_TEMP/s07-t03-context"
+          digest=$(jq -er '."containerimage.digest" | strings | select(test("^sha256:[0-9a-f]{64}$"))' "$metadata")
+          reference="$IMAGE@$digest"
+          docker pull --platform linux/amd64 "$reference"
+          docker image inspect "$reference" | jq -e --arg ref "$reference" --arg source "$source_url" \
+            --arg sha "$EXPECTED_MERGE_SHA" --arg tree "$EXPECTED_TREE_SHA" '
+              length == 1 and (.[0] | .Os == "linux" and .Architecture == "amd64"
+                and (.RepoDigests | index($ref) != null) and .Config.User == "65532:65532"
+                and .Config.Labels["org.opencontainers.image.source"] == $source
+                and .Config.Labels["org.opencontainers.image.revision"] == $sha
+                and .Config.Labels["io.github.gobler.source-tree"] == $tree)
+            ' >/dev/null
+          container=$(docker create --network none "$reference" /never-run)
+          trap 'docker rm "$container" >/dev/null' EXIT
+          docker export -o "$RUNNER_TEMP/s07-t03-image.tar" "$container"
+          python3 - <<'PY'
+          import hashlib
+          import json
+          import os
+          from pathlib import Path
+          import tarfile
+
+          temp = Path(os.environ['RUNNER_TEMP'])
+          expected = json.loads((temp / 's07-t03-files.json').read_text())
+          with tarfile.open(temp / 's07-t03-image.tar') as image:
+              files = [entry for entry in image if entry.name.startswith('fixture/') and entry.name != 'fixture/']
+              if sorted(entry.name for entry in files) != sorted(f'fixture/{name}' for name in expected):
+                  raise SystemExit('Unexpected set of files in the image pulled by digest')
+              for entry in files:
+                  if not entry.isfile() or entry.mode != 0o644:
+                      raise SystemExit('Unexpected image file type or mode')
+                  with image.extractfile(entry) as content:
+                      digest = hashlib.sha256(content.read()).hexdigest()
+                  if digest != expected[entry.name.removeprefix('fixture/')]:
+                      raise SystemExit('Image content differs from the verified squash blob')
+          PY
+          printf 'digest=%s\n' "$digest" >> "$GITHUB_OUTPUT"
+
+      - name: Attest the tested OCI digest
+        id: provenance
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
+        with:
+          subject-name: ${{ env.IMAGE }}
+          subject-digest: ${{ steps.image.outputs.digest }}
+          push-to-registry: true
+
+      - name: Verify registry provenance from the pinned workflow revision
+        env:
+          GH_TOKEN: ${{ github.token }}
+          DIGEST: ${{ steps.image.outputs.digest }}
+          ATTESTATION_ID: ${{ steps.provenance.outputs.attestation-id }}
+          ATTESTATION_URL: ${{ steps.provenance.outputs.attestation-url }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          reference="$IMAGE@$DIGEST"
+          gh attestation verify "oci://$reference" --bundle-from-oci --repo "$GITHUB_REPOSITORY" \
+            --signer-workflow "$GITHUB_REPOSITORY/.github/workflows/s07-t03-final-image.yml" \
+            --signer-digest "$GITHUB_SHA" --source-digest "$GITHUB_SHA" --source-ref "$GITHUB_REF" \
+            --deny-self-hosted-runners --format json > "$RUNNER_TEMP/s07-t03-provenance.json"
+          jq -e --arg image "$IMAGE" --arg hash "${DIGEST#sha256:}" '
+            any(.[].verificationResult.statement.subject[]; .name == $image and .digest.sha256 == $hash)
+          ' "$RUNNER_TEMP/s07-t03-provenance.json" >/dev/null
+          printf '### S07-T03 synthetic candidate\n\n- PR #1 head `%s`\n- Squash `%s`, tree `%s`\n- Tested image `%s`\n- Workflow commit `%s`\n- Provenance %s\n' \
+            "$EXPECTED_HEAD_SHA" "$EXPECTED_MERGE_SHA" "$EXPECTED_TREE_SHA" "$reference" "$GITHUB_SHA" \
+            "$ATTESTATION_URL" >> "$GITHUB_STEP_SUMMARY"
+          jq -cn --arg image "$reference" --arg digest "$DIGEST" \
+            --arg target "$EXPECTED_MERGE_SHA" --arg head "$EXPECTED_HEAD_SHA" --arg tree "$EXPECTED_TREE_SHA" \
+            --arg workflow "$GITHUB_SHA" --arg id "$ATTESTATION_ID" --arg url "$ATTESTATION_URL" \
+            '{status:"awaiting_staging",image:$image,digest:$digest,pr_head:$head,final_sha:$target,tree:$tree,workflow_sha:$workflow,attestation_id:$id,attestation_url:$url,registry_content_verified:true,oci_attestation_verified:true}' |
+            sed 's/^/GAI_S07_T03_IMAGE_RESULT /'
