@@ -1,0 +1,93 @@
+name: Verify S07-T03 fixture PR
+on:
+  push:
+    branches: [codex/t03-trusted-fixture-check]
+permissions: {}
+jobs:
+  verify:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 3
+    permissions:
+      checks: write
+      contents: read
+      pull-requests: read
+    steps:
+      - name: Verify exact PR fixture and report to the PR head
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          repo=Gobler/g-ai-publisher-acceptance
+          repo_id=1460060089
+          check_name=g-ai-fixture-diff-s07-t03
+          base=d8a1b64a51ae1676824e3c297b238f21cf0f7a59
+          head=28e9520db58827b74aa6bddf99d96602851ab96b
+          head_ref=codex/task-4144a7c0-b2da-4453-ab74-dd5bd89a9b55-g1
+          file=g-ai-acceptance-4144a7c0-b2da-4453-ab74-dd5bd89a9b55.txt
+          blob=ae6cf5660b6b17866a3f1b39b27bedaa38571697
+          endpoint="repos/$repo"
+          api() { gh api -H 'X-GitHub-Api-Version: 2022-11-28' "$@"; }
+
+          test "$GITHUB_REPOSITORY" = "$repo"
+          test "$GITHUB_REF" = refs/heads/codex/t03-trusted-fixture-check
+          test "$GITHUB_EVENT_NAME" = push
+          test "$GITHUB_ACTOR" = Gobler
+          test "$GITHUB_TRIGGERING_ACTOR" = Gobler
+
+          verify_pr() {
+            api "$endpoint/pulls/1" | jq -e \
+              --arg head "$head" --arg base "$base" --arg head_ref "$head_ref" \
+              --argjson repo_id "$repo_id" '
+                .number == 1 and .state == "open" and .draft == false and .changed_files == 1
+                and .head.sha == $head and .head.ref == $head_ref and .head.repo.id == $repo_id
+                and .base.sha == $base and .base.ref == "main" and .base.repo.id == $repo_id
+              ' > /dev/null
+          }
+          verify_pr
+          api "$endpoint/pulls/1/files?per_page=100" | jq -e --arg file "$file" --arg blob "$blob" '
+            length == 1 and (.[0] | .filename == $file and .sha == $blob and .status == "added"
+              and .additions == 1 and .deletions == 0 and .changes == 1)
+          ' > /dev/null
+
+          commit=$(api "$endpoint/git/commits/$head")
+          jq -e --arg head "$head" --arg base "$base" '
+            .sha == $head and [.parents[].sha] == [$base]
+          ' <<< "$commit" > /dev/null
+          base_tree=$(api "$endpoint/git/commits/$base" --jq '.tree.sha')
+          head_tree=$(jq -er '.tree.sha' <<< "$commit")
+          entries='if .truncated == false then [.tree[] | {path, mode, type, sha}] else error("Truncated tree") end'
+          before=$(api "$endpoint/git/trees/$base_tree" | jq -ec "$entries")
+          api "$endpoint/git/trees/$head_tree" | jq -e \
+            --argjson before "$before" --arg file "$file" --arg blob "$blob" \
+            "$entries"' | sort_by(.path) == (($before + [{path: $file, mode: "100644", type: "blob", sha: $blob}]) | sort_by(.path))' \
+            > /dev/null
+          encoded=$(api "$endpoint/git/blobs/$blob" | jq -er --arg blob "$blob" '
+            select(.sha == $blob and .encoding == "base64" and .size == 47) | .content
+          ')
+          printf '%s\n' "$encoded" | base64 --decode | cmp - <(printf '%s\n' 'Synthetic g-ai publication acceptance fixture.')
+
+          test "$(api "$endpoint/git/ref/heads/main" --jq '.object.sha')" = "$base"
+          test "$(api "$endpoint/git/ref/heads/$head_ref" --jq '.object.sha')" = "$head"
+          verify_pr
+          api "$endpoint/commits/$head/check-runs?check_name=$check_name&filter=all" |
+            jq -e '.total_count == 0' > /dev/null
+
+          details_url="$GITHUB_SERVER_URL/$repo/actions/runs/$GITHUB_RUN_ID/attempts/$GITHUB_RUN_ATTEMPT"
+          external_id="s07-t03-pr1:$GITHUB_SHA:$GITHUB_RUN_ID:$GITHUB_RUN_ATTEMPT"
+          result=$(jq -n --arg name "$check_name" --arg head "$head" \
+            --arg details_url "$details_url" --arg external_id "$external_id" \
+            --arg sha "$GITHUB_SHA" --arg base "$base" --arg blob "$blob" '
+              {name: $name, head_sha: $head, details_url: $details_url, external_id: $external_id,
+               status: "completed", conclusion: "success", output: {
+                 title: "Verified exact S07-T03 fixture diff",
+                 summary: "Verified PR #1 on base \($base), direct parent, one added 100644 text blob \($blob), and exact bytes. Workflow commit \($sha)."
+               }}
+            ' | api --method POST "$endpoint/check-runs" --input -)
+          jq -e --arg name "$check_name" --arg head "$head" --arg details_url "$details_url" \
+            --arg external_id "$external_id" '
+              select(.name == $name and .head_sha == $head and .details_url == $details_url
+                and .external_id == $external_id and .status == "completed" and .conclusion == "success"
+                and .app.id == 15368 and .app.slug == "github-actions")
+              | {id, name, head_sha, details_url, external_id, app: .app.id}
+            ' <<< "$result"
