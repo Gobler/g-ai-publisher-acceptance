@@ -1,0 +1,124 @@
+name: Verify and link the original S07-T03 provenance
+on:
+  push:
+    branches: [codex/t03-trusted-final-image-verify]
+permissions: {}
+concurrency:
+  group: s07-t03-fixture-provenance-verification
+  cancel-in-progress: false
+jobs:
+  verify:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 8
+    permissions:
+      contents: read
+      pull-requests: read
+      packages: write
+      attestations: read
+      actions: read
+    env:
+      IMAGE: ghcr.io/gobler/g-ai-publisher-acceptance-s07-t03
+      DIGEST: sha256:b7eeb02aef65e90cc1317f0a36ce1d1d388f2c7838ded4cbea2c84c0fff809e7
+      FINAL: 9d1c96cdd821dbff995a188bac23118279daf3ea
+      HEAD_SHA: 28e9520db58827b74aa6bddf99d96602851ab96b
+      BASE_SHA: d8a1b64a51ae1676824e3c297b238f21cf0f7a59
+      TREE: 1732794b6d2653e51bfe69792791578d40655bb5
+      BUILD_SHA: 31492c76337bade6b60e47e9997fd0e2a91bae23
+      BUILD_RUN: '44383599164'
+      BUNDLE_ID: '69318656'
+      BUNDLE_SHA: 665b58bf9221a98ee7f6bdae97ed320a805e49130299e5984c5d4f7b5b009714
+      MEDIA: application/vnd.dev.sigstore.bundle.v0.3+json
+      BUILD_REF: refs/heads/codex/t03-trusted-final-image
+    steps:
+      - name: Verify the existing image and attach its original signed bundle
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          repo=Gobler/g-ai-publisher-acceptance
+          test "$GITHUB_REPOSITORY" = "$repo"
+          test "$GITHUB_REPOSITORY_ID" = 1460060089
+          test "$GITHUB_REF" = refs/heads/codex/t03-trusted-final-image-verify
+          test "$GITHUB_EVENT_NAME" = push
+          test "$GITHUB_RUN_ATTEMPT" = 1
+          test "$GITHUB_ACTOR" = Gobler
+          test "$GITHUB_TRIGGERING_ACTOR" = Gobler
+          test "$GITHUB_SERVER_URL" = https://github.com
+          cd "$RUNNER_TEMP"
+          workflow=.github/workflows/s07-t03-final-image.yml
+          invocation="https://github.com/$repo/actions/runs/$BUILD_RUN/attempts/1"
+          reference="$IMAGE@$DIGEST"
+          tag="$IMAGE:sha-$FINAL"
+          api() { gh api --method GET -H 'X-GitHub-Api-Version: 2022-11-28' "repos/$repo/$1"; }
+          api 'pulls/1' | jq -e --arg final "$FINAL" --arg head "$HEAD_SHA" '
+            .state=="closed" and .merged==true and .merge_commit_sha==$final and .head.sha==$head
+            and .merged_by.id==357395813 and .merged_by.type=="Bot" and .merged_by.login=="g-ai-merger-gobler-20261116[bot]"
+            and .base.ref=="main" and .base.repo.id==1460060089 and .head.repo.id==1460060089
+          ' >/dev/null
+          api "git/ref/heads/main" | jq -e --arg final "$FINAL" '.object.sha==$final' >/dev/null
+          api "git/commits/$FINAL" | jq -e --arg final "$FINAL" --arg base "$BASE_SHA" --arg tree "$TREE" '
+            .sha==$final and [.parents[].sha]==[$base] and .tree.sha==$tree
+          ' >/dev/null
+          api "actions/runs/$BUILD_RUN" | jq -e --arg sha "$BUILD_SHA" --arg workflow "$workflow" '
+            .head_sha==$sha and .path==$workflow and .run_attempt==1 and .event=="push" and .status=="completed"
+          ' >/dev/null
+          api "actions/runs/$BUILD_RUN/attempts/1/jobs" | jq -e '
+            .total_count==1 and .jobs[0].id==135082086029 and any(.jobs[0].steps[];
+              .name=="Build and push the verified final commit, then test the pulled digest" and .conclusion=="success")
+          ' >/dev/null
+          api "attestations/$DIGEST" | jq -cSe --arg id "$BUNDLE_ID" --arg media "$MEDIA" '
+            select(.attestations|length==1) | .attestations[0]
+            | select(.repository_id==1460060089 and .bundle.mediaType==$media
+                     and (.bundle_url|split("?")[0]|split("/")[-1])==($id+".json.sn")) | .bundle
+          ' > original-provenance.sigstore.json
+          printf '%s  %s\n' "$BUNDLE_SHA" original-provenance.sigstore.json | sha256sum --check --status
+          curl -fLsS --proto '=https' --max-time 60 -o oras.tar.gz \
+            https://github.com/oras-project/oras/releases/download/v1.4.0/oras_1.4.0_linux_amd64.tar.gz
+          printf '%s  %s\n' d8e1dce2fd8ce996f1d901845b688eb0cf505a6082897606f053825bb47935d1 oras.tar.gz | sha256sum --check --status
+          tar -xzf oras.tar.gz oras
+          unset DOCKER_CONFIG
+          printf '%s' "$GH_TOKEN" | docker login ghcr.io --username "$GITHUB_ACTOR" --password-stdin
+          trap 'docker logout ghcr.io >/dev/null 2>&1 || true' EXIT
+          ./oras manifest fetch --descriptor "$tag" | jq -e --arg digest "$DIGEST" '.digest==$digest' >/dev/null
+          ./oras manifest fetch --descriptor "$reference" | jq -e --arg digest "$DIGEST" '.digest==$digest' >/dev/null
+          verify=(gh attestation verify "oci://$reference" --repo "$repo" --signer-workflow "$repo/$workflow"
+                  --signer-digest "$BUILD_SHA" --source-digest "$BUILD_SHA" --source-ref "$BUILD_REF"
+                  --deny-self-hosted-runners --format json)
+          "${verify[@]}" --bundle original-provenance.sigstore.json > verified-repository-attestation.json
+          jq -e --arg image "$IMAGE" --arg digest "${DIGEST#sha256:}" --arg invocation "$invocation" --arg sha "$BUILD_SHA" '
+            length == 1 and (.[0].verificationResult.statement
+              | .predicateType=="https://slsa.dev/provenance/v1"
+                and .subject==[{name:$image,digest:{sha256:$digest}}]
+                and .predicate.runDetails.metadata.invocationId==$invocation
+                and any(.predicate.buildDefinition.resolvedDependencies[];.digest.gitCommit==$sha))
+          ' verified-repository-attestation.json >/dev/null
+          # Discover before attaching so a previously completed write is never repeated.
+          ./oras discover --depth 1 --artifact-type "$MEDIA" --format json "$reference" > referrers.json
+          count=$(jq -er '.referrers | arrays | length' referrers.json)
+          if test "$count" = 0; then
+            ./oras attach --artifact-type "$MEDIA" --format json \
+              --annotation 'dev.sigstore.bundle.content=dsse-envelope' \
+              --annotation 'dev.sigstore.bundle.predicateType=https://slsa.dev/provenance/v1' \
+              "$reference" "original-provenance.sigstore.json:$MEDIA" > attached.json
+            referrer=$(jq -er '.digest' attached.json)
+          elif test "$count" = 1; then
+            referrer=$(jq -er '.referrers[0].digest' referrers.json)
+          else
+            exit 1
+          fi
+          [[ "$referrer" =~ ^sha256:[0-9a-f]{64}$ ]]
+          ./oras manifest fetch "$IMAGE@$referrer" | jq -e --arg media "$MEDIA" --arg digest "$DIGEST" --arg hash "sha256:$BUNDLE_SHA" '
+            .artifactType==$media and .subject.digest==$digest and (.layers|length)==1
+            and .layers[0].digest==$hash and .layers[0].mediaType==$media
+          ' >/dev/null
+          "${verify[@]}" --bundle-from-oci > verified-registry-attestation.json
+          jq -e --slurpfile repository verified-repository-attestation.json '
+            length==1 and .[0].verificationResult.statement==$repository[0][0].verificationResult.statement
+          ' verified-registry-attestation.json >/dev/null
+          ./oras manifest fetch --descriptor "$tag" | jq -e --arg digest "$DIGEST" '.digest==$digest' >/dev/null
+          jq -cn --arg image "$reference" --arg digest "$DIGEST" --arg final "$FINAL" --arg head "$HEAD_SHA" --arg tree "$TREE" \
+            --arg build "$BUILD_SHA" --arg build_run "$BUILD_RUN" --arg bundle_id "$BUNDLE_ID" --arg bundle_sha256 "$BUNDLE_SHA" \
+            --arg referrer "$referrer" --arg recovery "$GITHUB_SHA" --arg run "$GITHUB_RUN_ID" \
+            '{status:"awaiting_staging",image:$image,digest:$digest,pr_head:$head,final_sha:$final,tree:$tree,build_workflow_sha:$build,build_run_id:$build_run,bundle_id:$bundle_id,bundle_sha256:$bundle_sha256,oci_referrer_digest:$referrer,recovery_workflow_sha:$recovery,recovery_run_id:$run,original_signature_verified:true,oci_attestation_verified:true,existing_candidate_tag_unchanged:true}' |
+            sed 's/^/GAI_S07_T03_RECOVERY_RESULT /'
